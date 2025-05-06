@@ -70,11 +70,13 @@ namespace solution {
         cudaMemset(d_histogram, 0, sizeof(int) * B);
 
         // Kernel launch parameters
-        dim3 Db(256);  // 256 threads per block
-        dim3 Dg((N + Db.x - 1) / Db.x);  // enough blocks to cover N elements
+        int threads_per_block = 256;
+        int blocks = (N + threads_per_block - 1) / threads_per_block;
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        size_t shared_mem_size = warps_per_block * PADDED(B) * sizeof(int);
 
         // Launch naive kernel
-        computeHistogramKernel<<<Dg, Db, sizeof(int) * PADDED(B)>>>(d_input, d_histogram, N, B);
+        computeHistogramKernel<<<blocks, threads_per_block, shared_mem_size>>>(d_input, d_histogram, N, B);
         cudaDeviceSynchronize();  // Ensure kernel is done
 
         // Copy result back to host
