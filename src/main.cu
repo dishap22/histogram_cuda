@@ -6,44 +6,58 @@
 #include <string>
 #include <cuda_runtime.h>
 
-#define PADDED(i) (i + (i / 32))
 #define WARP_SIZE 32
+#define BLOCK_SIZE 256
 
-__global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
+__global__ void computeHistogramKernel(const int* __restrict__ input, int* __restrict__ global_histogram, int N, int B) {
+    const int padding = 1;
+    const int padded_B = B + padding;
+
     extern __shared__ int shared_array[];
 
     int tid = threadIdx.x;
     int global_id = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
 
-    int warp_id = tid / WARP_SIZE;
-    int lane_id = tid % WARP_SIZE;
-    int warps_per_block = blockDim.x / WARP_SIZE;
+    int* shared_hist = shared_array;
 
-    // Initialize shared memory histogram
-    for (int i = tid; i < warps_per_block * B; i += blockDim.x) {
-        shared_array[i] = 0;
+    for (int i = tid; i < padded_B; i += blockDim.x) {
+        if (i < B) {
+            shared_hist[i] = 0;
+        }
     }
     __syncthreads();
 
-    // Compute local histogram
-    if (global_id < N) {
-        int bin = input[global_id];
+    for (int i = global_id; i < N; i += stride) {
+        int bin = input[i];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&shared_array[warp_id * B + bin], 1);
+            atomicAdd(&shared_hist[bin], 1);
         }
     }
     __syncthreads();
 
-    // Merge local histograms to global histogram
-    for (int i = tid; i < B; i += blockDim.x) {
-        int sum = 0;
-        for (int w = 0; w < warps_per_block; ++w) {
-            sum += shared_array[w * B + i];
-        }
-        if (sum > 0) {
-            atomicAdd(&global_histogram[i], sum);
+    for (int bin = tid; bin < B; bin += blockDim.x) {
+        int count = shared_hist[bin];
+        if (count > 0) {
+            atomicAdd(&global_histogram[bin], count);
         }
     }
+}
+
+int getOptimalGridSize(int blockSize, int N) {
+    int deviceId;
+    cudaGetDevice(&deviceId);
+
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, deviceId);
+
+    int maxActiveBlocks;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, computeHistogramKernel, blockSize, 0);
+
+    int maxBlocks = maxActiveBlocks * props.multiProcessorCount;
+    int blocksNeeded = (N + blockSize - 1) / blockSize;
+
+    return min(blocksNeeded, maxBlocks);
 }
 
 namespace solution {
@@ -72,12 +86,12 @@ namespace solution {
         cudaMemset(d_histogram, 0, sizeof(int) * B);
 
         // Kernel launch parameters
-        int threads_per_block = 256;
-        int blocks = (N + threads_per_block - 1) / threads_per_block;
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        size_t shared_mem_size = warps_per_block * B * sizeof(int);
+        int threads_per_block = BLOCK_SIZE;
+        int blocks = getOptimalGridSize(threads_per_block, N);
+        const int padding = 1;
+        const int padded_B = B + padding;
+        size_t shared_mem_size = padded_B * sizeof(int);
 
-        // Launch kernel
         computeHistogramKernel<<<blocks, threads_per_block, shared_mem_size>>>(d_input, d_histogram, N, B);
         cudaDeviceSynchronize();  // Ensure kernel is done
 
