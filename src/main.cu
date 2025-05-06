@@ -7,15 +7,30 @@
 #include <cuda_runtime.h>
 
 
-__global__ void computeHistogramKernel(const int* input, int* histogram, int N, int B) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        int bin = input[idx];
+__global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
+    extern __shared__ int shared_hist[];
+
+    int tid = threadIdx.x;
+    int global_id = blockIdx.x * blockDim.x + tid;
+
+    for (int i = tid; i < B; i += blockDim.x) {
+        shared_hist[i] = 0;
+    }
+    __syncthreads();
+
+    if (global_id < N) {
+        int bin = input[global_id];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&histogram[bin], 1);
+            atomicAdd(&shared_hist[bin], 1);
         }
     }
+    __syncthreads();
+
+    for (int i = tid; i < B; i += blockDim.x) {
+        atomicAdd(&global_histogram[i], shared_hist[i]);
+    }
 }
+
 
 namespace solution {
     std::string compute(const std::string &input_path, int N, int B) {
@@ -47,7 +62,7 @@ namespace solution {
         dim3 Dg((N + Db.x - 1) / Db.x);  // enough blocks to cover N elements
 
         // Launch naive kernel
-        computeHistogramKernel<<<Dg, Db>>>(d_input, d_histogram, N, B);
+        computeHistogramKernel<<<Dg, Db, sizeof(int) * B>>>(d_input, d_histogram, N, B);
         cudaDeviceSynchronize();  // Ensure kernel is done
 
         // Copy result back to host
