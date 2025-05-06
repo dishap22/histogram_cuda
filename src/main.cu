@@ -73,7 +73,7 @@ namespace solution {
         int threads_per_block = 256;
         int blocks = (N + threads_per_block - 1) / threads_per_block;
         int warps_per_block = threads_per_block / WARP_SIZE;
-        size_t shared_mem_size = warps_per_block * PADDED(B) * sizeof(int);
+        size_t shared_mem_size = warps_per_block * B * sizeof(int);
 
         // Launch naive kernel
         computeHistogramKernel<<<blocks, threads_per_block, shared_mem_size>>>(d_input, d_histogram, N, B);
