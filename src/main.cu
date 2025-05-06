@@ -9,13 +9,15 @@
 #define PADDED(i) (i + (i / 32))
 
 __global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
-    __shared__ int shared_hist[1024 + 32];
+    __shared__ int* shared_hist;
+    extern __shared__ int shared_array[];
+    shared_hist = shared_array;
 
     int tid = threadIdx.x;
     int global_id = blockIdx.x * blockDim.x + tid;
 
     for (int i = tid; i < B; i += blockDim.x) {
-        shared_hist[PADDED(i)] = 0;
+        if (i < B) shared_hist[PADDED(i)] = 0;
     }
     __syncthreads();
 
@@ -63,7 +65,7 @@ namespace solution {
         dim3 Dg((N + Db.x - 1) / Db.x);  // enough blocks to cover N elements
 
         // Launch naive kernel
-        computeHistogramKernel<<<Dg, Db, sizeof(int) * B>>>(d_input, d_histogram, N, B);
+        computeHistogramKernel<<<Dg, Db, sizeof(int) * PADDED(B)>>>(d_input, d_histogram, N, B);
         cudaDeviceSynchronize();  // Ensure kernel is done
 
         // Copy result back to host
