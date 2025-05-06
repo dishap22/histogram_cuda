@@ -6,28 +6,29 @@
 #include <string>
 #include <cuda_runtime.h>
 
+#define PADDED(i) (i + (i / 32))
 
 __global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
-    extern __shared__ int shared_hist[];
+    __shared__ int shared_hist[1024 + 32];
 
     int tid = threadIdx.x;
     int global_id = blockIdx.x * blockDim.x + tid;
 
     for (int i = tid; i < B; i += blockDim.x) {
-        shared_hist[i] = 0;
+        shared_hist[PADDED(i)] = 0;
     }
     __syncthreads();
 
     if (global_id < N) {
         int bin = input[global_id];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&shared_hist[bin], 1);
+            atomicAdd(&shared_hist[PADDED(bin)], 1);
         }
     }
     __syncthreads();
 
     for (int i = tid; i < B; i += blockDim.x) {
-        atomicAdd(&global_histogram[i], shared_hist[i]);
+        atomicAdd(&global_histogram[i], shared_hist[PADDED(i)]);
     }
 }
 
