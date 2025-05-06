@@ -5,52 +5,44 @@
 #include <filesystem>
 #include <string>
 #include <cuda_runtime.h>
-#include <chrono>
 
 #define PADDED(i) (i + (i / 32))
+#define WARP_SIZE 32
 
-void computeHistogramCPU(const int* input, int* histogram, int N, int B) {
-    for (int i = 0; i < N; i++) {
-        int bin = input[i];
-        if (bin >= 0 && bin < B) {
-            histogram[bin]++;
-        }
-    }
-}
-
-__global__ void computeHistogramKernelNaive(const int* input, int* histogram, int N, int B) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        int bin = input[idx];
-        if (bin >= 0 && bin < B) {
-            atomicAdd(&histogram[bin], 1);
-        }
-    }
-}
-
-__global__ void computeHistogramKernelShared(const int* input, int* global_histogram, int N, int B) {
-    __shared__ int* shared_hist;
+__global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
     extern __shared__ int shared_array[];
-    shared_hist = shared_array;
 
     int tid = threadIdx.x;
     int global_id = blockIdx.x * blockDim.x + tid;
 
-    for (int i = tid; i < B; i += blockDim.x) {
-        if (i < B) shared_hist[PADDED(i)] = 0;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int warps_per_block = blockDim.x / WARP_SIZE;
+
+    // Initialize shared memory histogram
+    for (int i = tid; i < warps_per_block * B; i += blockDim.x) {
+        shared_array[i] = 0;
     }
     __syncthreads();
 
+    // Compute local histogram
     if (global_id < N) {
         int bin = input[global_id];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&shared_hist[PADDED(bin)], 1);
+            atomicAdd(&shared_array[warp_id * B + bin], 1);
         }
     }
     __syncthreads();
 
+    // Merge local histograms to global histogram
     for (int i = tid; i < B; i += blockDim.x) {
-        atomicAdd(&global_histogram[i], shared_hist[PADDED(i)]);
+        int sum = 0;
+        for (int w = 0; w < warps_per_block; ++w) {
+            sum += shared_array[w * B + i];
+        }
+        if (sum > 0) {
+            atomicAdd(&global_histogram[i], sum);
+        }
     }
 }
 
@@ -60,24 +52,14 @@ namespace solution {
         std::ofstream sol_fs(sol_path, std::ios::binary);
         std::ifstream input_fs(input_path, std::ios::binary);
 
+        // Read input data on host
         const auto input_data = std::make_unique<int[]>(N);
         input_fs.read(reinterpret_cast<char*>(input_data.get()), sizeof(int) * N);
         input_fs.close();
 
-        // Prepare histogram on the host
+        // Allocate and initialize histogram on host
         auto histogram = std::make_unique<int[]>(B);
         for (int i = 0; i < B; i++) histogram[i] = 0;
-
-        // CPU Histogram Benchmarking
-        auto cpu_histogram = std::make_unique<int[]>(B);
-        std::copy(histogram.get(), histogram.get() + B, cpu_histogram.get());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        computeHistogramCPU(input_data.get(), cpu_histogram.get(), N, B);
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<float> cpu_duration = end - start;
-        float cpu_time_seconds = cpu_duration.count();
-        std::cout << "CPU Histogram Execution Time: " << cpu_time_seconds << " seconds\n";
 
         // Allocate device memory
         int *d_input = nullptr;
@@ -89,53 +71,24 @@ namespace solution {
         cudaMemcpy(d_input, input_data.get(), sizeof(int) * N, cudaMemcpyHostToDevice);
         cudaMemset(d_histogram, 0, sizeof(int) * B);
 
-        // Naive GPU Histogram Benchmarking
-        dim3 Db(256);  // 256 threads per block
-        dim3 Dg((N + Db.x - 1) / Db.x);  // enough blocks to cover N elements
+        // Kernel launch parameters
+        int threads_per_block = 256;
+        int blocks = (N + threads_per_block - 1) / threads_per_block;
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        size_t shared_mem_size = warps_per_block * B * sizeof(int);
 
-        cudaEvent_t start_gpu_naive, stop_gpu_naive;
-        cudaEventCreate(&start_gpu_naive);
-        cudaEventCreate(&stop_gpu_naive);
+        // Launch kernel
+        computeHistogramKernel<<<blocks, threads_per_block, shared_mem_size>>>(d_input, d_histogram, N, B);
+        cudaDeviceSynchronize();  // Ensure kernel is done
 
-        cudaEventRecord(start_gpu_naive);
-        computeHistogramKernelNaive<<<Dg, Db>>>(d_input, d_histogram, N, B);
-        cudaEventRecord(stop_gpu_naive);
-
-        cudaDeviceSynchronize();
-        float gpu_naive_ms = 0;
-        cudaEventElapsedTime(&gpu_naive_ms, start_gpu_naive, stop_gpu_naive);
-        float gpu_naive_seconds = gpu_naive_ms / 1000.0f;  // Convert milliseconds to seconds
-        std::cout << "Naive GPU Histogram Execution Time: " << gpu_naive_seconds << " seconds\n";
-
-        // Shared Memory GPU Histogram Benchmarking
-        int *d_shared_histogram = nullptr;
-        cudaMalloc(&d_shared_histogram, sizeof(int) * B);
-
-        cudaMemset(d_shared_histogram, 0, sizeof(int) * B);
-
-        cudaEvent_t start_gpu_shared, stop_gpu_shared;
-        cudaEventCreate(&start_gpu_shared);
-        cudaEventCreate(&stop_gpu_shared);
-
-        cudaEventRecord(start_gpu_shared);
-        computeHistogramKernelShared<<<Dg, Db, sizeof(int) * PADDED(B)>>>(d_input, d_shared_histogram, N, B);
-        cudaEventRecord(stop_gpu_shared);
-
-        cudaDeviceSynchronize();
-        float gpu_shared_ms = 0;
-        cudaEventElapsedTime(&gpu_shared_ms, start_gpu_shared, stop_gpu_shared);
-        float gpu_shared_seconds = gpu_shared_ms / 1000.0f;  // Convert milliseconds to seconds
-        std::cout << "Shared Memory GPU Histogram Execution Time: " << gpu_shared_seconds << " seconds\n";
-
-        // Copy result back to host for Shared Memory GPU
-        cudaMemcpy(histogram.get(), d_shared_histogram, sizeof(int) * B, cudaMemcpyDeviceToHost);
+        // Copy result back to host
+        cudaMemcpy(histogram.get(), d_histogram, sizeof(int) * B, cudaMemcpyDeviceToHost);
 
         // Cleanup
         cudaFree(d_input);
         cudaFree(d_histogram);
-        cudaFree(d_shared_histogram);
 
-        // Write the output histogram for any of the results
+        // Write output
         sol_fs.write(reinterpret_cast<const char*>(histogram.get()), sizeof(int) * B);
         sol_fs.close();
 
