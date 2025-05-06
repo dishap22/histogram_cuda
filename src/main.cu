@@ -7,39 +7,30 @@
 #include <cuda_runtime.h>
 
 #define PADDED(i) (i + (i / 32))
-#define WARP_SIZE 32
 
 __global__ void computeHistogramKernel(const int* input, int* global_histogram, int N, int B) {
+    __shared__ int* shared_hist;
     extern __shared__ int shared_array[];
+    shared_hist = shared_array;
 
     int tid = threadIdx.x;
     int global_id = blockIdx.x * blockDim.x + tid;
 
-    int warp_id = tid / WARP_SIZE;
-    int lane_id = tid % WARP_SIZE;
-    int warps_per_block = blockDim.x / WARP_SIZE;
-
-    int* shared_hist = &shared_array[warp_id * B];
-
-    for (int i = lane_id; i < B; i += WARP_SIZE) {
-        shared_hist[i] = 0;
+    for (int i = tid; i < B; i += blockDim.x) {
+        if (i < B) shared_hist[PADDED(i)] = 0;
     }
     __syncthreads();
 
     if (global_id < N) {
         int bin = input[global_id];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&shared_hist[bin], 1);
+            atomicAdd(&shared_hist[PADDED(bin)], 1);
         }
     }
     __syncthreads();
 
-    if (tid < B) {
-        int total = 0;
-        for (int w = 0; w < warps_per_block; ++w) {
-            total += shared_hist[w * B + tid];
-        }
-        atomicAdd(&global_histogram[tid], total);
+    for (int i = tid; i < B; i += blockDim.x) {
+        atomicAdd(&global_histogram[i], shared_hist[PADDED(i)]);
     }
 }
 
@@ -70,13 +61,11 @@ namespace solution {
         cudaMemset(d_histogram, 0, sizeof(int) * B);
 
         // Kernel launch parameters
-        int threads_per_block = 256;
-        int blocks = (N + threads_per_block - 1) / threads_per_block;
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        size_t shared_mem_size = warps_per_block * B * sizeof(int);
+        dim3 Db(256);  // 256 threads per block
+        dim3 Dg((N + Db.x - 1) / Db.x);  // enough blocks to cover N elements
 
         // Launch naive kernel
-        computeHistogramKernel<<<blocks, threads_per_block, shared_mem_size>>>(d_input, d_histogram, N, B);
+        computeHistogramKernel<<<Dg, Db, sizeof(int) * PADDED(B)>>>(d_input, d_histogram, N, B);
         cudaDeviceSynchronize();  // Ensure kernel is done
 
         // Copy result back to host
