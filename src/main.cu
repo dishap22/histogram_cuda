@@ -19,17 +19,17 @@ __global__ void computeHistogramKernel(const int* input, int* global_histogram, 
     int lane_id = tid % WARP_SIZE;
     int warps_per_block = blockDim.x / WARP_SIZE;
 
-    int* shared_hist = &shared_array[warp_id * PADDED(B)];
+    int* shared_hist = &shared_array[warp_id * B];
 
     for (int i = lane_id; i < B; i += WARP_SIZE) {
-        shared_hist[PADDED(i)] = 0;
+        shared_hist[i] = 0;
     }
     __syncthreads();
 
     if (global_id < N) {
         int bin = input[global_id];
         if (bin >= 0 && bin < B) {
-            atomicAdd(&shared_hist[PADDED(bin)], 1);
+            atomicAdd(&shared_hist[bin], 1);
         }
     }
     __syncthreads();
@@ -37,7 +37,7 @@ __global__ void computeHistogramKernel(const int* input, int* global_histogram, 
     if (tid < B) {
         int total = 0;
         for (int w = 0; w < warps_per_block; ++w) {
-            total += shared_hist[w * PADDED(B) + PADDED(tid)];
+            total += shared_hist[w * B + tid];
         }
         atomicAdd(&global_histogram[tid], total);
     }
